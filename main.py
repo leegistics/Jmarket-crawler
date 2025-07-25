@@ -21,18 +21,43 @@ def get_sheets():
 async def crawl_buyee(keyword: str) -> list[dict]:
     search_url = f"https://buyee.jp/mercari/search?keyword={keyword}"
     items = []
+
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, slow_mo=50)
-        page = await browser.new_page()
+        # Stealth headless launch
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+            ],
+        )
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/115.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1920, "height": 1080},
+        )
+        # Hide webdriver property
+        await context.add_init_script(
+            "() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); }"
+        )
+        page = await context.new_page()
+
         # 1) 페이지 로드
         await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(3000)
+
         # 2) iframe 진입
         iframe_el = await page.wait_for_selector("iframe#search_result_iframe", timeout=20000)
         frame = await iframe_el.content_frame()
+
         # 3) 링크 수집
         await frame.wait_for_selector('a.simple_container__llX1q', timeout=15000)
         links = await frame.query_selector_all('a.simple_container__llX1q')
+
         for link in links:
             # SOLD 건너뛰기
             if await link.query_selector("span.sold_text__yvzaS"):
@@ -50,14 +75,16 @@ async def crawl_buyee(keyword: str) -> list[dict]:
                 "url":     href if href.startswith("http") else f"https://buyee.jp{href}",
                 "date":    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             })
+
         await browser.close()
+
     return items
 
 async def main():
     code_ws, list_ws = get_sheets()
 
     # 1열(code)과 2열(maximum_price) 읽기
-    codes = code_ws.col_values(1)[1:]
+    codes   = code_ws.col_values(1)[1:]
     max_raw = code_ws.col_values(2)[1:]
     max_map = {}
     for code, mp in zip(codes, max_raw):
@@ -76,6 +103,7 @@ async def main():
         limit = max_map.get(kw)
         print(f"\n=== Crawling Buyee: {kw} (max={'∞' if limit is None else limit}엔) ===")
         results = await crawl_buyee(kw)
+
         if not results:
             if '' not in existing_urls:
                 new_rows.append([
@@ -84,11 +112,12 @@ async def main():
                 existing_urls.add('')
         else:
             for it in results:
-                # 가격 문자열에서 숫자만 추출
+                # 가격 숫자만 추출
                 price_num = int(re.sub(r"[^\d]", "", it['price'])) if it['price'] else 0
-                # 한도 초과 시 건너뛰기
+                # 한도 초과 시 스킵
                 if limit is not None and price_num > limit:
                     continue
+                # 중복 URL 방지
                 if it['url'] in existing_urls:
                     continue
                 img_formula = f'=IMAGE("{it["image"]}",1)' if it["image"] else ''
@@ -101,6 +130,7 @@ async def main():
                     it['date']
                 ])
                 existing_urls.add(it['url'])
+
         print(f"✅ {kw}: 배치에 {len(new_rows)}개 누적")
 
     if new_rows:
@@ -109,4 +139,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
