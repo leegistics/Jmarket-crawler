@@ -23,7 +23,7 @@ async def crawl_buyee(keyword: str) -> list[dict]:
     items = []
 
     async with async_playwright() as pw:
-        # Stealth headless launch
+        # 스텔스 헤드리스 브라우저 실행
         browser = await pw.chromium.launch(
             headless=True,
             args=[
@@ -40,40 +40,61 @@ async def crawl_buyee(keyword: str) -> list[dict]:
             ),
             viewport={"width": 1920, "height": 1080},
         )
-        # Hide webdriver property
+        # navigator.webdriver 은폐
         await context.add_init_script(
             "() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); }"
         )
         page = await context.new_page()
 
-        # 1) 페이지 로드
+        # 1) 페이지 로드 및 완전 로드 대기
         await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(3000)
+        await page.wait_for_load_state("networkidle", timeout=60000)
 
-        # 2) iframe 진입
-        iframe_el = await page.wait_for_selector("iframe#search_result_iframe", timeout=20000)
-        frame = await iframe_el.content_frame()
+        # 2) 디버깅: 로드된 모든 프레임 출력
+        for f in page.frames:
+            print(f"▶ frame: name={f.name!r}, url={f.url!r}")
 
-        # 3) 링크 수집
-        await frame.wait_for_selector('a.simple_container__llX1q', timeout=15000)
+        # 3) name 속성 기반 iframe 탐색
+        frame = None
+        try:
+            iframe_el = await page.wait_for_selector(
+                'iframe[name="search_result_iframe"]', timeout=10000
+            )
+            frame = await iframe_el.content_frame()
+        except:
+            pass
+
+        # 4) name 셀렉터 실패 시 URL 패턴으로 대체
+        if not frame:
+            for f in page.frames:
+                if "asf.buyee.jp/mercari" in f.url:
+                    frame = f
+                    break
+
+        if not frame:
+            raise RuntimeError("search_result_iframe frame not found")
+
+        # 5) 상품 리스트 수집
+        await frame.wait_for_selector('a.simple_container__llX1q', timeout=60000)
         links = await frame.query_selector_all('a.simple_container__llX1q')
 
         for link in links:
-            # SOLD 건너뛰기
+            # SOLD‑out 제외
             if await link.query_selector("span.sold_text__yvzaS"):
                 continue
-            # 데이터 수집
+
             title_el = await link.query_selector("span.simple_name__XMcbt")
             price_el = await link.query_selector("span.simple_price__h13DP")
             img_el   = await link.query_selector("img")
             href     = await link.get_attribute("href") or ""
+
             items.append({
-                "code":    keyword,
-                "title":   (await title_el.inner_text()).strip() if title_el else "",
-                "price":   (await price_el.inner_text()).strip() if price_el else "",
-                "image":   await img_el.get_attribute("src") if img_el else "",
-                "url":     href if href.startswith("http") else f"https://buyee.jp{href}",
-                "date":    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                "code":  keyword,
+                "title": (await title_el.inner_text()).strip() if title_el else "",
+                "price": (await price_el.inner_text()).strip() if price_el else "",
+                "image": await img_el.get_attribute("src") if img_el else "",
+                "url":   href if href.startswith("http") else f"https://buyee.jp{href}",
+                "date":  datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             })
 
         await browser.close()
@@ -83,7 +104,7 @@ async def crawl_buyee(keyword: str) -> list[dict]:
 async def main():
     code_ws, list_ws = get_sheets()
 
-    # 1열(code)과 2열(maximum_price) 읽기
+    # 코드 및 최대 가격 맵
     codes   = code_ws.col_values(1)[1:]
     max_raw = code_ws.col_values(2)[1:]
     max_map = {}
@@ -94,7 +115,7 @@ async def main():
         try:
             max_map[c] = int(mp.replace(",", "").strip())
         except:
-            max_map[c] = None  # 비어있거나 숫자가 아니면 무제한
+            max_map[c] = None
 
     existing_urls = set(list_ws.col_values(5)[1:])
     new_rows = []
@@ -105,37 +126,32 @@ async def main():
         results = await crawl_buyee(kw)
 
         if not results:
-            if '' not in existing_urls:
+            if "" not in existing_urls:
                 new_rows.append([
-                    kw, '결과 없음', '', '', '', datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    kw, "결과 없음", "", "", "", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 ])
-                existing_urls.add('')
+                existing_urls.add("")
         else:
             for it in results:
-                # 가격 숫자만 추출
-                price_num = int(re.sub(r"[^\d]", "", it['price'])) if it['price'] else 0
-                # 한도 초과 시 스킵
+                # 가격 필터링
+                price_num = int(re.sub(r"[^\d]", "", it["price"])) if it["price"] else 0
                 if limit is not None and price_num > limit:
                     continue
-                # 중복 URL 방지
-                if it['url'] in existing_urls:
+                # 중복 방지
+                if it["url"] in existing_urls:
                     continue
-                img_formula = f'=IMAGE("{it["image"]}",1)' if it["image"] else ''
+                img_formula = f'=IMAGE("{it["image"]}",1)' if it["image"] else ""
                 new_rows.append([
-                    it['code'],
-                    it['title'],
-                    it['price'],
-                    img_formula,
-                    it['url'],
-                    it['date']
+                    it["code"], it["title"], it["price"],
+                    img_formula, it["url"], it["date"]
                 ])
-                existing_urls.add(it['url'])
+                existing_urls.add(it["url"])
 
         print(f"✅ {kw}: 배치에 {len(new_rows)}개 누적")
 
     if new_rows:
-        list_ws.insert_rows(new_rows, row=2, value_input_option='USER_ENTERED')
-        list_ws.sort((6, 'des'))
+        list_ws.insert_rows(new_rows, row=2, value_input_option="USER_ENTERED")
+        list_ws.sort((6, "des"))
 
 if __name__ == "__main__":
     asyncio.run(main())
