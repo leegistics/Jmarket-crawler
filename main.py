@@ -19,9 +19,11 @@ def get_sheets():
     return ss.worksheet(CODE_SHEET), ss.worksheet(LIST_SHEET)
 
 async def crawl_buyee(keyword: str) -> list[dict]:
+    # 1) 초기 검색 페이지 URL
     initial_url = f"https://buyee.jp/mercari/search?keyword={keyword}"
+
     async with async_playwright() as pw:
-        # Stealth headless launch
+        # Stealth headless
         browser = await pw.chromium.launch(
             headless=True,
             args=[
@@ -38,40 +40,44 @@ async def crawl_buyee(keyword: str) -> list[dict]:
             ),
             viewport={"width": 1920, "height": 1080},
         )
-        # Hide navigator.webdriver
         await context.add_init_script(
             "() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); }"
         )
         page = await context.new_page()
 
-        # 1) Load initial page
+        # 2) 초기 페이지 로드 & idle 대기
         await page.goto(initial_url, wait_until="networkidle", timeout=60000)
 
-        # 2) Poll for the Mercari iframe by name
-        frame = None
-        for _ in range(60):  # up to 60 seconds
-            frame = page.frame(name="search_result_iframe")
-            if frame:
-                break
-            await asyncio.sleep(1)
+        # 3) iframe src 추출 시도
+        iframe_src = None
+        try:
+            iframe_el = await page.query_selector('iframe[name="search_result_iframe"]')
+            iframe_src = await iframe_el.get_attribute("src")
+        except:
+            pass
 
-        # 3) Fallback: match by URL pattern
-        if not frame:
-            for f in page.frames:
-                if "asf.buyee.jp/mercari" in f.url:
-                    frame = f
-                    break
+        # 4) fallback: 직접 조립한 iframe URL
+        if not iframe_src:
+            iframe_src = (
+                f"https://asf.buyee.jp/mercari"
+                f"?keyword={keyword}"
+                "&conversionType=Mercari_DirectSearch"
+                "&currencyCode=KRW"
+                "&myee=0"
+                "&languageCode=en"
+                "&lang=en"
+            )
 
-        if not frame:
-            raise RuntimeError("search_result_iframe frame not found")
+        # 5) iframe URL 로드
+        await page.goto(iframe_src, wait_until="networkidle", timeout=60000)
 
-        # 4) Scrape product entries inside the iframe
-        await frame.wait_for_selector('a.simple_container__llX1q', timeout=60000)
-        links = await frame.query_selector_all('a.simple_container__llX1q')
+        # 6) 상품 리스트 스크래핑
+        await page.wait_for_selector('a.simple_container__llX1q', timeout=60000)
+        links = await page.query_selector_all('a.simple_container__llX1q')
 
         items = []
         for link in links:
-            # Skip sold‑out items
+            # SOLD‑out 제외
             if await link.query_selector("span.sold_text__yvzaS"):
                 continue
 
@@ -94,8 +100,6 @@ async def crawl_buyee(keyword: str) -> list[dict]:
 
 async def main():
     code_ws, list_ws = get_sheets()
-
-    # Read codes and maximum prices
     codes   = code_ws.col_values(1)[1:]
     max_raw = code_ws.col_values(2)[1:]
     max_map = {}
