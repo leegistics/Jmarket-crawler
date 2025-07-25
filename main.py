@@ -22,7 +22,7 @@ async def crawl_buyee(keyword: str) -> list[dict]:
     search_url = f"https://buyee.jp/mercari/search?keyword={keyword}"
     items = []
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=False, slow_mo=50)
+        browser = await pw.chromium.launch(headless=True, slow_mo=50)
         page = await browser.new_page()
         # 1) 페이지 로드
         await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
