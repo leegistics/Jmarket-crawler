@@ -13,17 +13,17 @@ CODE_SHEET = 'code'
 LIST_SHEET = 'list'
 
 def get_sheets():
-    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+    creds = Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_FILE, scopes=SCOPES
+    )
     client = gspread.authorize(creds)
     ss = client.open_by_key(SPREADSHEET_ID)
     return ss.worksheet(CODE_SHEET), ss.worksheet(LIST_SHEET)
 
 async def crawl_buyee(keyword: str) -> list[dict]:
-    search_url = f"https://buyee.jp/mercari/search?keyword={keyword}"
-    items = []
-
+    # 1) 처음엔 buyee.jp 메인 검색 페이지로 가서 iframe src를 뽑아낸다
+    initial_url = f"https://buyee.jp/mercari/search?keyword={keyword}"
     async with async_playwright() as pw:
-        # 스텔스 헤드리스 브라우저 실행
         browser = await pw.chromium.launch(
             headless=True,
             args=[
@@ -40,44 +40,28 @@ async def crawl_buyee(keyword: str) -> list[dict]:
             ),
             viewport={"width": 1920, "height": 1080},
         )
-        # navigator.webdriver 은폐
+        # 자동화 플래그 은폐
         await context.add_init_script(
-            "() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); }"
+            "() => { Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); }"
         )
         page = await context.new_page()
 
-        # 1) 페이지 로드 및 완전 로드 대기
-        await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_load_state("networkidle", timeout=60000)
+        # — buyee.jp 검색 페이지 로드 —
+        await page.goto(initial_url, wait_until="domcontentloaded", timeout=60000)
+        # iframe 요소가 붙을 때까지 충분히 기다림
+        await page.wait_for_selector('iframe[src*="asf.buyee.jp/mercari"]', timeout=60000)
+        # 해당 iframe의 src 추출
+        iframe_el = await page.query_selector('iframe[src*="asf.buyee.jp/mercari"]')
+        iframe_src = await iframe_el.get_attribute("src")
 
-        # 2) 디버깅: 로드된 모든 프레임 출력
-        for f in page.frames:
-            print(f"▶ frame: name={f.name!r}, url={f.url!r}")
+        # 2) 바로 iframe src로 이동해서 동적 콘텐츠 로드
+        await page.goto(iframe_src, wait_until="networkidle", timeout=60000)
 
-        # 3) name 속성 기반 iframe 탐색
-        frame = None
-        try:
-            iframe_el = await page.wait_for_selector(
-                'iframe[name="search_result_iframe"]', timeout=10000
-            )
-            frame = await iframe_el.content_frame()
-        except:
-            pass
+        # 3) 이제 main_frame에서 상품 리스트 스크래핑
+        await page.wait_for_selector('a.simple_container__llX1q', timeout=60000)
+        links = await page.query_selector_all('a.simple_container__llX1q')
 
-        # 4) name 셀렉터 실패 시 URL 패턴으로 대체
-        if not frame:
-            for f in page.frames:
-                if "asf.buyee.jp/mercari" in f.url:
-                    frame = f
-                    break
-
-        if not frame:
-            raise RuntimeError("search_result_iframe frame not found")
-
-        # 5) 상품 리스트 수집
-        await frame.wait_for_selector('a.simple_container__llX1q', timeout=60000)
-        links = await frame.query_selector_all('a.simple_container__llX1q')
-
+        items = []
         for link in links:
             # SOLD‑out 제외
             if await link.query_selector("span.sold_text__yvzaS"):
@@ -98,24 +82,18 @@ async def crawl_buyee(keyword: str) -> list[dict]:
             })
 
         await browser.close()
-
-    return items
+        return items
 
 async def main():
     code_ws, list_ws = get_sheets()
-
-    # 코드 및 최대 가격 맵
     codes   = code_ws.col_values(1)[1:]
     max_raw = code_ws.col_values(2)[1:]
     max_map = {}
-    for code, mp in zip(codes, max_raw):
-        c = code.strip()
-        if not c:
-            continue
+    for c, mp in zip(codes, max_raw):
         try:
-            max_map[c] = int(mp.replace(",", "").strip())
+            max_map[c.strip()] = int(mp.replace(",", "").strip())
         except:
-            max_map[c] = None
+            max_map[c.strip()] = None
 
     existing_urls = set(list_ws.col_values(5)[1:])
     new_rows = []
@@ -127,27 +105,20 @@ async def main():
 
         if not results:
             if "" not in existing_urls:
-                new_rows.append([
-                    kw, "결과 없음", "", "", "", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                ])
+                new_rows.append([kw, "결과 없음", "", "", "", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
                 existing_urls.add("")
         else:
             for it in results:
-                # 가격 필터링
                 price_num = int(re.sub(r"[^\d]", "", it["price"])) if it["price"] else 0
                 if limit is not None and price_num > limit:
                     continue
-                # 중복 방지
                 if it["url"] in existing_urls:
                     continue
                 img_formula = f'=IMAGE("{it["image"]}",1)' if it["image"] else ""
-                new_rows.append([
-                    it["code"], it["title"], it["price"],
-                    img_formula, it["url"], it["date"]
-                ])
+                new_rows.append([it["code"], it["title"], it["price"], img_formula, it["url"], it["date"]])
                 existing_urls.add(it["url"])
 
-        print(f"✅ {kw}: 배치에 {len(new_rows)}개 누적")
+        print(f"✅ {kw}: 누적 {len(new_rows)}개")
 
     if new_rows:
         list_ws.insert_rows(new_rows, row=2, value_input_option="USER_ENTERED")
