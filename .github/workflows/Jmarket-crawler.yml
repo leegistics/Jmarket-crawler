@@ -1,9 +1,9 @@
 name: Jmarket Crawler Manual + Scheduled
 
 on:
-  workflow_dispatch:  # 👉 수동 실행 지원
+  workflow_dispatch:
   schedule:
-    - cron: '0 */3 * * *'  # 👉 3시간마다 실행 (UTC 기준)
+    - cron: '0 */3 * * *'  # 3시간마다 실행 (UTC 기준)
 
 jobs:
   run-crawler:
@@ -28,4 +28,6 @@ jobs:
           echo "${{ secrets.GOOGLE_CREDENTIALS_JSON }}" | base64 --decode > credentials.json
 
       - name: Run crawler script
+        env:
+          RESIDENTIAL_PROXY: ${{ secrets.RESIDENTIAL_PROXY }}
         run: python main.py
