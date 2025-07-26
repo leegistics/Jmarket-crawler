@@ -28,6 +28,10 @@ jobs:
           echo "${{ secrets.GOOGLE_CREDENTIALS_JSON }}" | base64 --decode > credentials.json
 
       - name: Run crawler script
+        # 프록시 환경변수 제거 → 직접 연결
         env:
-          RESIDENTIAL_PROXY: ${{ secrets.RESIDENTIAL_PROXY }}
+          HTTP_PROXY: ''
+          HTTPS_PROXY: ''
+          NO_PROXY: 'buyee.jp'
         run: python main.py
+
