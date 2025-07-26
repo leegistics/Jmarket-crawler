@@ -1,6 +1,9 @@
 import asyncio
-from datetime import datetime
+import os
 import re
+from collections import Counter
+from datetime import datetime
+
 import gspread
 from google.oauth2.service_account import Credentials
 from playwright.async_api import async_playwright
@@ -13,17 +16,38 @@ CODE_SHEET = 'code'
 LIST_SHEET = 'list'
 
 def get_sheets():
+    """
+    서비스 계정으로 인증 후
+    'code' 시트와 'list' 시트를 반환합니다.
+    """
     creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
     client = gspread.authorize(creds)
     ss = client.open_by_key(SPREADSHEET_ID)
     return ss.worksheet(CODE_SHEET), ss.worksheet(LIST_SHEET)
 
+async def auto_scroll(page):
+    """
+    페이지를 끝까지 스크롤해 lazy‑load된 아이템까지 모두 불러옵니다.
+    """
+    prev_height = await page.evaluate("() => document.body.scrollHeight")
+    while True:
+        await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(1)
+        new_height = await page.evaluate("() => document.body.scrollHeight")
+        if new_height == prev_height:
+            break
+        prev_height = new_height
+
 async def crawl_buyee(keyword: str) -> list[dict]:
-    # 1) 초기 검색 페이지 URL
-    initial_url = f"https://buyee.jp/mercari/search?keyword={keyword}"
+    """
+    1) Buyee 검색 페이지 열기
+    2) iframe src 직접 추출 or fallback URL 조립
+    3) iframe 페이지로 이동 → auto_scroll
+    4) 동적으로 추출한 CSS 클래스 또는 href 패턴으로 상품 링크 스크랩
+    """
+    search_url = f"https://buyee.jp/mercari/search?keyword={keyword}"
 
     async with async_playwright() as pw:
-        # Stealth headless
         browser = await pw.chromium.launch(
             headless=True,
             args=[
@@ -45,39 +69,54 @@ async def crawl_buyee(keyword: str) -> list[dict]:
         )
         page = await context.new_page()
 
-        # 2) 초기 페이지 로드 & idle 대기
-        await page.goto(initial_url, wait_until="networkidle", timeout=60000)
+        # 1) 검색 페이지 로드 & idle 대기
+        await page.goto(search_url, wait_until="networkidle", timeout=60000)
 
-        # 3) iframe src 추출 시도
-        iframe_src = None
-        try:
-            iframe_el = await page.query_selector('iframe[name="search_result_iframe"]')
-            iframe_src = await iframe_el.get_attribute("src")
-        except:
-            pass
-
-        # 4) fallback: 직접 조립한 iframe URL
+        # 2) iframe src 직접 추출 시도
+        iframe_el = await page.query_selector('iframe[name="search_result_iframe"]')
+        iframe_src = await iframe_el.get_attribute("src") if iframe_el else None
         if not iframe_src:
             iframe_src = (
-                f"https://asf.buyee.jp/mercari"
-                f"?keyword={keyword}"
+                f"https://asf.buyee.jp/mercari?keyword={keyword}"
                 "&conversionType=Mercari_DirectSearch"
-                "&currencyCode=KRW"
-                "&myee=0"
-                "&languageCode=en"
-                "&lang=en"
+                "&currencyCode=KRW&myee=0&languageCode=en&lang=en"
             )
 
-        # 5) iframe URL 로드
+        # 3) iframe 페이지 로드 & auto_scroll
         await page.goto(iframe_src, wait_until="networkidle", timeout=60000)
+        await auto_scroll(page)
 
-        # 6) 상품 리스트 스크래핑
-        await page.wait_for_selector('a.simple_container__llX1q', timeout=60000)
-        links = await page.query_selector_all('a.simple_container__llX1q')
+        # 4) CI용 디버그: HTML 덤프 & 스크린샷
+        if os.getenv("CI"):
+            content = await page.content()
+            print("===== PAGE CONTENT DUMP =====")
+            print(content[:1000])
+            print("===== END OF DUMP =====")
+            await page.screenshot(path="ci-dump.png", full_page=True)
+
+        # 5) 동적 클래스 추출: /item/ href 가진 <a> 태그에서 가장 빈도 높은 class
+        html = await page.content()
+        classes = re.findall(
+            r'<a[^>]+href="[^"]*?/item/[^"]*"[^>]*class="([^"]+)"',
+            html
+        )
+        counter = Counter()
+        for cls_str in classes:
+            for cls in cls_str.split():
+                counter[cls] += 1
+        if counter:
+            top_class = counter.most_common(1)[0][0]
+            selector = f'a.{top_class}'
+        else:
+            selector = 'a[href*="/item/"]'
+
+        # 6) 상품 링크 수집
+        await page.wait_for_selector(selector, timeout=60000)
+        links = await page.query_selector_all(selector)
 
         items = []
         for link in links:
-            # SOLD‑out 제외
+            # Sold‑out 제외
             if await link.query_selector("span.sold_text__yvzaS"):
                 continue
 
@@ -102,12 +141,15 @@ async def main():
     code_ws, list_ws = get_sheets()
     codes   = code_ws.col_values(1)[1:]
     max_raw = code_ws.col_values(2)[1:]
+
+    # 최대 가격 매핑: 쉼표 제거 후 숫자 변환
     max_map = {}
-    for c, mp in zip(codes, max_raw):
+    for code, raw in zip(codes, max_raw):
+        mp_clean = raw.replace(",", "").strip()
         try:
-            max_map[c.strip()] = int(mp.replace(",", "").strip())
-        except:
-            max_map[c.strip()] = None
+            max_map[code.strip()] = int(mp_clean) if mp_clean else None
+        except ValueError:
+            max_map[code.strip()] = None
 
     existing_urls = set(list_ws.col_values(5)[1:])
     new_rows = []
@@ -120,7 +162,8 @@ async def main():
         if not results:
             if "" not in existing_urls:
                 new_rows.append([
-                    kw, "결과 없음", "", "", "", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    kw, "결과 없음", "", "", "",
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 ])
                 existing_urls.add("")
         else:
@@ -137,7 +180,7 @@ async def main():
                 ])
                 existing_urls.add(it["url"])
 
-        print(f"✅ {kw}: accumulated {len(new_rows)} items")
+        print(f"✅ {kw}: 누적 {len(new_rows)}개")
 
     if new_rows:
         list_ws.insert_rows(new_rows, row=2, value_input_option="USER_ENTERED")
