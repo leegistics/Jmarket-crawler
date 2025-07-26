@@ -1,12 +1,12 @@
 import asyncio
 import os
 import re
+from collections import Counter
 from datetime import datetime
 
 import gspread
 from google.oauth2.service_account import Credentials
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
 
 # — Proxy 설정 제거 (직접 연결 보장)
 os.environ.pop('HTTP_PROXY', None)
@@ -15,7 +15,7 @@ os.environ.pop('HTTPS_PROXY', None)
 # — Google Sheets 설정
 SERVICE_ACCOUNT_FILE = 'credentials.json'
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-SPREADSHEET_ID = '1GSro604hDjybH5bhO4h_ZtcMCi_QdV-9ZYnMnH5kdo'
+SPREADSHEET_ID = '1GSro604hDjybH5bhOQ4h_ZtcMCi_QdV-9ZYnMnH5kdo'
 CODE_SHEET = 'code'
 LIST_SHEET = 'list'
 
@@ -40,10 +40,18 @@ async def crawl_buyee(keyword: str) -> list[dict]:
     proxy_server = os.getenv("RESIDENTIAL_PROXY")  # 선택적 residential proxy
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox"]
-        )
+        launch_opts = {
+            "headless": True,
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+            ],
+        }
+        if proxy_server:
+            launch_opts["proxy"] = {"server": proxy_server}
+
+        browser = await pw.chromium.launch(**launch_opts)
         context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -51,22 +59,17 @@ async def crawl_buyee(keyword: str) -> list[dict]:
                 "Chrome/115.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1920, "height": 1080},
-            locale="en-US",
-            timezone_id="Asia/Seoul",
-            extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://buyee.jp/",
-            }
+        )
+        # Headless 탐지 회피
+        await context.add_init_script(
+            "() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); }"
         )
         page = await context.new_page()
-
-        # Stealth 적용: 탐지 회피 강화
-        await stealth_async(page)
 
         # 1) 검색 페이지 로드
         await page.goto(search_url, wait_until="networkidle", timeout=60000)
 
-        # 2) iframe 로드 또는 fallback
+        # 2) iframe src 찾기 또는 fallback
         iframe_el = await page.query_selector('iframe[name="search_result_iframe"]')
         iframe_src = await iframe_el.get_attribute("src") if iframe_el else None
         if not iframe_src:
@@ -76,7 +79,7 @@ async def crawl_buyee(keyword: str) -> list[dict]:
                 "&currencyCode=KRW&myee=0&languageCode=en&lang=en"
             )
 
-        # 3) iframe 페이지로 이동 후 스크롤
+        # 3) iframe 로드 후 스크롤
         await page.goto(iframe_src, wait_until="networkidle", timeout=60000)
         await auto_scroll(page)
 
@@ -90,9 +93,8 @@ async def crawl_buyee(keyword: str) -> list[dict]:
 
         # 5) 동적 클래스 추출
         html = await page.content()
-        from collections import Counter
         classes = re.findall(
-            r'<a[^>]+href="[^\"]*?/item/[^\"]*"[^>]*class="([^"]+)"',
+            r'<a[^>]+href="[^"]*?/item/[^"]*"[^>]*class="([^"]+)"',
             html
         )
         counter = Counter()
@@ -102,7 +104,7 @@ async def crawl_buyee(keyword: str) -> list[dict]:
         top_class = counter.most_common(1)[0][0] if counter else None
         selector = f'a.{top_class}' if top_class else 'a[href*="/item/"]'
 
-        # 6) 항목 수집 및 후처리
+        # 6) 항목 수집
         await page.wait_for_selector(selector, timeout=60000)
         links = await page.query_selector_all(selector)
 
@@ -115,9 +117,9 @@ async def crawl_buyee(keyword: str) -> list[dict]:
             title_el = await link.query_selector("span.simple_name__XMcbt")
             price_el = await link.query_selector("span.simple_price__h13DP")
             img_el   = await link.query_selector("img")
+            href     = await link.get_attribute("href") or ""
 
-            href = await link.get_attribute("href") or ""
-            # undefined 경로 제거
+            # ← 이 한 줄만 추가했습니다:
             href = href.replace("/undefined/", "/")
 
             items.append({
@@ -137,8 +139,7 @@ async def main():
     codes   = code_ws.col_values(1)[1:]
     max_raw = code_ws.col_values(2)[1:]
 
-    # 최대 가격 맵핑: 빈칸(None) 혹은 숫자
-    # 스프레드시트 2열의 'max price' 값을 읽어옵니다.
+    # 최대 가격 파싱
     max_map = {}
     for code, raw in zip(codes, max_raw):
         clean = raw.replace(",", "").strip()
@@ -151,7 +152,6 @@ async def main():
     new_rows = []
 
     for kw in codes:
-        # 코드별로 설정된 최대 가격을 조회합니다.
         limit = max_map.get(kw)
         print(f"\n=== Crawling Buyee: {kw} (max={'∞' if limit is None else limit}엔) ===")
         results = await crawl_buyee(kw)
@@ -165,14 +165,11 @@ async def main():
                 existing_urls.add("")
         else:
             for it in results:
-                # 가격 문자열에서 숫자만 추출하여 정수 변환
                 price_num = int(re.sub(r"[^\d]", "", it["price"])) if it["price"] else 0
-                # 지정된 최대 가격(limit) 이상은 스킵
                 if limit is not None and price_num > limit:
                     continue
                 if it["url"] in existing_urls:
                     continue
-
                 img_formula = f'=IMAGE("{it["image"]}",1)' if it["image"] else ""
                 new_rows.append([
                     it["code"], it["title"], it["price"],
