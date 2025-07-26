@@ -16,19 +16,12 @@ CODE_SHEET = 'code'
 LIST_SHEET = 'list'
 
 def get_sheets():
-    """
-    서비스 계정으로 인증 후
-    'code' 시트와 'list' 시트를 반환합니다.
-    """
     creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
     client = gspread.authorize(creds)
     ss = client.open_by_key(SPREADSHEET_ID)
     return ss.worksheet(CODE_SHEET), ss.worksheet(LIST_SHEET)
 
 async def auto_scroll(page):
-    """
-    페이지를 끝까지 스크롤해 lazy‑load된 아이템까지 모두 불러옵니다.
-    """
     prev_height = await page.evaluate("() => document.body.scrollHeight")
     while True:
         await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
@@ -39,23 +32,23 @@ async def auto_scroll(page):
         prev_height = new_height
 
 async def crawl_buyee(keyword: str) -> list[dict]:
-    """
-    1) Buyee 검색 페이지 열기
-    2) iframe src 직접 추출 or fallback URL 조립
-    3) iframe 페이지로 이동 → auto_scroll
-    4) 동적으로 추출한 CSS 클래스 또는 href 패턴으로 상품 링크 스크랩
-    """
     search_url = f"https://buyee.jp/mercari/search?keyword={keyword}"
+    proxy_server = os.getenv("RESIDENTIAL_PROXY")  # e.g. "http://user:pass@proxy.example.com:8000"
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=[
+        # Stealth headless launch with optional residential proxy
+        launch_options = {
+            "headless": True,
+            "args": [
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
             ],
-        )
+        }
+        if proxy_server:
+            launch_options["proxy"] = {"server": proxy_server}
+
+        browser = await pw.chromium.launch(**launch_options)
         context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -69,10 +62,10 @@ async def crawl_buyee(keyword: str) -> list[dict]:
         )
         page = await context.new_page()
 
-        # 1) 검색 페이지 로드 & idle 대기
+        # 1) 검색 페이지 로드 & 네트워크 유휴 대기
         await page.goto(search_url, wait_until="networkidle", timeout=60000)
 
-        # 2) iframe src 직접 추출 시도
+        # 2) iframe src 추출 또는 fallback URL 조립
         iframe_el = await page.query_selector('iframe[name="search_result_iframe"]')
         iframe_src = await iframe_el.get_attribute("src") if iframe_el else None
         if not iframe_src:
@@ -86,7 +79,7 @@ async def crawl_buyee(keyword: str) -> list[dict]:
         await page.goto(iframe_src, wait_until="networkidle", timeout=60000)
         await auto_scroll(page)
 
-        # 4) CI용 디버그: HTML 덤프 & 스크린샷
+        # 4) CI용 디버그 (선택)
         if os.getenv("CI"):
             content = await page.content()
             print("===== PAGE CONTENT DUMP =====")
@@ -94,7 +87,7 @@ async def crawl_buyee(keyword: str) -> list[dict]:
             print("===== END OF DUMP =====")
             await page.screenshot(path="ci-dump.png", full_page=True)
 
-        # 5) 동적 클래스 추출: /item/ href 가진 <a> 태그에서 가장 빈도 높은 class
+        # 5) 링크 클래스 동적 추출
         html = await page.content()
         classes = re.findall(
             r'<a[^>]+href="[^"]*?/item/[^"]*"[^>]*class="([^"]+)"',
@@ -116,7 +109,6 @@ async def crawl_buyee(keyword: str) -> list[dict]:
 
         items = []
         for link in links:
-            # Sold‑out 제외
             if await link.query_selector("span.sold_text__yvzaS"):
                 continue
 
