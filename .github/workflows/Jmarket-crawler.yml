@@ -1,16 +1,16 @@
+# .github/workflows/jmarket-crawler.yml
 name: Jmarket Crawler Manual + Scheduled
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */3 * * *'  # 3시간마다 실행 (UTC 기준)
+    - cron: '0 */3 * * *'  # 매 3시간마다 실행 (UTC 기준)
 
 jobs:
   run-crawler:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -20,7 +20,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install gspread google-auth playwright
+          pip install gspread google-auth playwright playwright-stealth
           playwright install chromium
 
       - name: Decode and save credentials.json
@@ -28,10 +28,10 @@ jobs:
           echo "${{ secrets.GOOGLE_CREDENTIALS_JSON }}" | base64 --decode > credentials.json
 
       - name: Run crawler script
-        # 프록시 환경변수 제거 → 직접 연결
         env:
+          RESIDENTIAL_PROXY: ${{ secrets.RESIDENTIAL_PROXY }}
           HTTP_PROXY: ''
           HTTPS_PROXY: ''
-          NO_PROXY: 'buyee.jp'
+          NO_PROXY: ''
+          CI: 'true'
         run: python main.py
-
