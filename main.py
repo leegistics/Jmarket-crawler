@@ -122,6 +122,7 @@ async def crawl_buyee(keyword: str) -> list[dict]:
             price_el = await link.query_selector("span.simple_price__h13DP")
             img_el   = await link.query_selector("img")
             href     = await link.get_attribute("href") or ""
+            href = href.replace("/undefined/", "/")
 
             items.append({
                 "code":  keyword,
